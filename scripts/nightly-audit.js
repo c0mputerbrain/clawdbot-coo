@@ -463,6 +463,51 @@ function generateReport(stats) {
   return report;
 }
 
+// ── Telegram Alert ─────────────────────────────────────────────
+function sendTelegramAlert(grade, criticals, warnings, stats) {
+  const CREDS_PATH = path.resolve(COO_ROOT, '.credentials', 'telegram.json');
+  if (!fs.existsSync(CREDS_PATH)) {
+    console.log('No Telegram credentials found — skipping alert.');
+    return;
+  }
+
+  const { bot_token, chat_id } = JSON.parse(fs.readFileSync(CREDS_PATH, 'utf-8'));
+  if (!bot_token || !chat_id) return;
+
+  let msg = `COO Nightly Audit -- ${TODAY}\nGrade: ${grade}\n\n`;
+  msg += `KB: ${stats.kbFiles} files | Memory: ${stats.memFiles} files | Scripts: ${stats.scriptFiles}\n\n`;
+
+  if (criticals.length > 0) {
+    msg += `CRITICAL (${criticals.length}):\n`;
+    for (const f of criticals) {
+      msg += `  ${f.category}: ${f.message}\n`;
+    }
+    msg += '\n';
+  }
+
+  if (warnings.length > 0) {
+    msg += `WARNINGS (${warnings.length}):\n`;
+    for (const f of warnings) {
+      msg += `  ${f.category}: ${f.message}\n`;
+    }
+    msg += '\n';
+  }
+
+  msg += `Full report: clawdbot-coo/reports/audit-${TODAY}.md`;
+
+  try {
+    execSync(
+      `curl -s -X POST "https://api.telegram.org/bot${bot_token}/sendMessage" ` +
+      `--data-urlencode "chat_id=${chat_id}" ` +
+      `--data-urlencode "text=${msg.replace(/"/g, '\\"')}"`,
+      { encoding: 'utf-8', timeout: 15000 }
+    );
+    console.log('Telegram alert sent.');
+  } catch (err) {
+    console.error('Failed to send Telegram alert:', err.message);
+  }
+}
+
 // ── Main ───────────────────────────────────────────────────────
 function main() {
   console.log(`=== COO Nightly Audit — ${TODAY} ===\n`);
@@ -507,17 +552,29 @@ function main() {
   fs.writeFileSync(REPORT_PATH, report, 'utf-8');
 
   // Print summary
-  const criticals = findings.filter(f => f.severity === SEV.CRITICAL).length;
-  const warnings = findings.filter(f => f.severity === SEV.WARNING).length;
+  const criticalFindings = findings.filter(f => f.severity === SEV.CRITICAL);
+  const warningFindings = findings.filter(f => f.severity === SEV.WARNING);
   const passed = findings.filter(f => f.severity === SEV.OK).length;
 
   console.log(`\n=== Results ===`);
-  console.log(`  Criticals: ${criticals}`);
-  console.log(`  Warnings:  ${warnings}`);
+  console.log(`  Criticals: ${criticalFindings.length}`);
+  console.log(`  Warnings:  ${warningFindings.length}`);
   console.log(`  Passed:    ${passed}`);
   console.log(`\nReport saved: ${REPORT_PATH}`);
 
-  if (criticals > 0) {
+  // Send Telegram alert if there are issues
+  if (criticalFindings.length > 0 || warningFindings.length > 0) {
+    let grade;
+    if (criticalFindings.length > 0) grade = 'F -- Critical issues found';
+    else if (warningFindings.length > 3) grade = 'C -- Multiple warnings';
+    else grade = 'B -- Minor issues';
+
+    sendTelegramAlert(grade, criticalFindings, warningFindings, stats);
+  } else {
+    console.log('\nAll checks passed — no Telegram alert needed.');
+  }
+
+  if (criticalFindings.length > 0) {
     console.log('\n⚠️  CRITICAL issues detected — review report immediately!');
     process.exit(2);
   }
