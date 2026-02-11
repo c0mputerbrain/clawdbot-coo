@@ -5,7 +5,10 @@
  * Pulls latest edgebot-brain from GitHub, runs automated checks,
  * generates a health report, and flags issues.
  *
- * Usage: node scripts/nightly-audit.js [--repo-path /path/to/edgebot-brain]
+ * Usage: node scripts/nightly-audit.js [--repo-path /path/to/edgebot-brain] [--fix]
+ *
+ * Flags:
+ *   --fix    Auto-fix safe issues (rebuild index, repair frontmatter, etc.)
  *
  * Checks performed:
  *   1. Frontmatter validation (all KB files must have YAML frontmatter)
@@ -26,9 +29,11 @@ const { execSync } = require('child_process');
 
 // ── Config ─────────────────────────────────────────────────────
 const REPO_PATH_ARG = process.argv.find((a, i) => process.argv[i - 1] === '--repo-path');
+const FIX_MODE = process.argv.includes('--fix');
 const EDGE_REPO = REPO_PATH_ARG || path.resolve(__dirname, '..', '..', 'edgebot-brain');
 const COO_ROOT = path.resolve(__dirname, '..');
 const REPORT_DIR = path.resolve(COO_ROOT, 'reports');
+const TRENDS_PATH = path.resolve(COO_ROOT, 'reports', 'trends.json');
 const KNOWLEDGE_DIR = path.resolve(EDGE_REPO, 'knowledge');
 const MEMORY_DIR = path.resolve(EDGE_REPO, 'memory');
 const SCRIPTS_DIR = path.resolve(EDGE_REPO, 'scripts');
@@ -91,6 +96,12 @@ function addFinding(severity, category, message, details = null) {
   findings.push({ severity, category, message, details });
 }
 
+const autoFixes = [];
+
+function addAutoFix(description, action) {
+  autoFixes.push({ description, action });
+}
+
 // Check 1: Frontmatter validation
 function checkFrontmatter() {
   const files = getAllFiles(KNOWLEDGE_DIR);
@@ -124,11 +135,23 @@ function checkFrontmatter() {
       addFinding(SEV.WARNING, 'Frontmatter',
         `${missing.length} files missing frontmatter`,
         missing.slice(0, 20).join('\n') + (missing.length > 20 ? `\n... and ${missing.length - 20} more` : ''));
+      addAutoFix(`Tag ${missing.length} untagged files + rebuild index`, () => {
+        const kbUpdate = path.resolve(EDGE_REPO, 'scripts', 'kb-update.js');
+        if (fs.existsSync(kbUpdate)) {
+          shellExec(`node "${kbUpdate}"`, EDGE_REPO);
+        }
+      });
     }
     if (incomplete.length > 0) {
       addFinding(SEV.WARNING, 'Frontmatter',
         `${incomplete.length} files with incomplete frontmatter`,
         incomplete.slice(0, 10).map(i => `${i.file}: missing ${i.missing.join(', ')}`).join('\n'));
+      addAutoFix(`Repair ${incomplete.length} incomplete frontmatter files`, () => {
+        const kbUpdate = path.resolve(EDGE_REPO, 'scripts', 'kb-update.js');
+        if (fs.existsSync(kbUpdate)) {
+          shellExec(`node "${kbUpdate}"`, EDGE_REPO);
+        }
+      });
     }
   }
 
@@ -155,10 +178,22 @@ function checkIndexFreshness(actualFileCount) {
       addFinding(SEV.WARNING, 'Index',
         `Index is STALE: ${diff} files added since last rebuild`,
         `Indexed: ${indexedCount}, Actual: ${actualFileCount}\nLast generated: ${generated}\nFix: node scripts/kb-update.js`);
+      addAutoFix('Rebuild KB index (stale)', () => {
+        const kbUpdate = path.resolve(EDGE_REPO, 'scripts', 'kb-update.js');
+        if (fs.existsSync(kbUpdate)) {
+          shellExec(`node "${kbUpdate}"`, EDGE_REPO);
+        }
+      });
     } else {
       addFinding(SEV.WARNING, 'Index',
         `Index has ${Math.abs(diff)} more files than exist (files deleted without rebuilding)`,
         `Fix: node scripts/kb-update.js`);
+      addAutoFix('Rebuild KB index (orphaned entries)', () => {
+        const kbUpdate = path.resolve(EDGE_REPO, 'scripts', 'kb-update.js');
+        if (fs.existsSync(kbUpdate)) {
+          shellExec(`node "${kbUpdate}"`, EDGE_REPO);
+        }
+      });
     }
   } catch (err) {
     addFinding(SEV.CRITICAL, 'Index', `SEARCH-INDEX.json is corrupted: ${err.message}`);
@@ -235,7 +270,7 @@ function checkSecrets() {
 
 // Check 5: Script version sprawl
 function checkVersionSprawl() {
-  const jsFiles = getAllFiles(SCRIPTS_DIR, '.js');
+  const jsFiles = getAllFiles(SCRIPTS_DIR, '.js').filter(f => !f.includes('_archive'));
   const basenames = {};
 
   for (const f of jsFiles) {
@@ -464,7 +499,7 @@ function generateReport(stats) {
 }
 
 // ── Telegram Alert ─────────────────────────────────────────────
-function sendTelegramAlert(grade, criticals, warnings, stats) {
+function sendTelegramAlert(grade, criticals, warnings, stats, trendMsg = '') {
   const CREDS_PATH = path.resolve(COO_ROOT, '.credentials', 'telegram.json');
   if (!fs.existsSync(CREDS_PATH)) {
     console.log('No Telegram credentials found — skipping alert.');
@@ -474,7 +509,7 @@ function sendTelegramAlert(grade, criticals, warnings, stats) {
   const { bot_token, chat_id } = JSON.parse(fs.readFileSync(CREDS_PATH, 'utf-8'));
   if (!bot_token || !chat_id) return;
 
-  let msg = `COO Nightly Audit -- ${TODAY}\nGrade: ${grade}\n\n`;
+  let msg = `Oops Nightly Audit -- ${TODAY}\nGrade: ${grade}\n\n`;
   msg += `KB: ${stats.kbFiles} files | Memory: ${stats.memFiles} files | Scripts: ${stats.scriptFiles}\n\n`;
 
   if (criticals.length > 0) {
@@ -493,6 +528,8 @@ function sendTelegramAlert(grade, criticals, warnings, stats) {
     msg += '\n';
   }
 
+  if (trendMsg) msg += trendMsg + '\n\n';
+
   msg += `Full report: clawdbot-coo/reports/audit-${TODAY}.md`;
 
   try {
@@ -508,10 +545,144 @@ function sendTelegramAlert(grade, criticals, warnings, stats) {
   }
 }
 
+// ── Trend Tracking ────────────────────────────────────────────
+function loadTrends() {
+  try {
+    return JSON.parse(fs.readFileSync(TRENDS_PATH, 'utf-8'));
+  } catch {
+    return { entries: [] };
+  }
+}
+
+function saveTrends(trends) {
+  fs.writeFileSync(TRENDS_PATH, JSON.stringify(trends, null, 2), 'utf-8');
+}
+
+function recordTrend(stats, criticals, warnings) {
+  const trends = loadTrends();
+
+  // Don't double-record the same day
+  if (trends.entries.length > 0 && trends.entries[trends.entries.length - 1].date === TODAY) {
+    trends.entries[trends.entries.length - 1] = {
+      date: TODAY,
+      kbFiles: stats.kbFiles,
+      kbSizeMB: parseFloat(stats.kbSizeMB),
+      memFiles: stats.memFiles,
+      memSizeMB: parseFloat(stats.memSizeMB),
+      scriptFiles: stats.scriptFiles,
+      criticals,
+      warnings,
+      grade: criticals > 0 ? 'F' : warnings > 3 ? 'C' : warnings > 0 ? 'B' : 'A',
+    };
+  } else {
+    trends.entries.push({
+      date: TODAY,
+      kbFiles: stats.kbFiles,
+      kbSizeMB: parseFloat(stats.kbSizeMB),
+      memFiles: stats.memFiles,
+      memSizeMB: parseFloat(stats.memSizeMB),
+      scriptFiles: stats.scriptFiles,
+      criticals,
+      warnings,
+      grade: criticals > 0 ? 'F' : warnings > 3 ? 'C' : warnings > 0 ? 'B' : 'A',
+    });
+  }
+
+  // Keep last 90 days
+  if (trends.entries.length > 90) {
+    trends.entries = trends.entries.slice(-90);
+  }
+
+  saveTrends(trends);
+  return trends;
+}
+
+function analyzeTrends(trends) {
+  if (trends.entries.length < 2) return null;
+
+  const prev = trends.entries[trends.entries.length - 2];
+  const curr = trends.entries[trends.entries.length - 1];
+
+  const analysis = {
+    kbFilesDelta: curr.kbFiles - prev.kbFiles,
+    kbSizeDelta: (curr.kbSizeMB - prev.kbSizeMB).toFixed(1),
+    memFilesDelta: curr.memFiles - prev.memFiles,
+    memSizeDelta: (curr.memSizeMB - prev.memSizeMB).toFixed(1),
+    scriptsDelta: curr.scriptFiles - prev.scriptFiles,
+    gradeChange: prev.grade !== curr.grade ? `${prev.grade} -> ${curr.grade}` : null,
+    regressions: [],
+  };
+
+  // Detect regressions
+  if (curr.criticals > prev.criticals) {
+    analysis.regressions.push(`Criticals increased: ${prev.criticals} -> ${curr.criticals}`);
+  }
+  if (curr.warnings > prev.warnings + 2) {
+    analysis.regressions.push(`Warnings spiked: ${prev.warnings} -> ${curr.warnings}`);
+  }
+  if (curr.memSizeMB > prev.memSizeMB * 1.5 && curr.memSizeMB > 5) {
+    analysis.regressions.push(`Memory bloat: ${prev.memSizeMB} MB -> ${curr.memSizeMB} MB`);
+  }
+
+  // Week-over-week if enough data
+  if (trends.entries.length >= 7) {
+    const weekAgo = trends.entries[trends.entries.length - 7];
+    analysis.weekKbGrowth = curr.kbFiles - weekAgo.kbFiles;
+    analysis.weekMemGrowth = curr.memFiles - weekAgo.memFiles;
+  }
+
+  return analysis;
+}
+
+// ── Auto-Fix Execution ────────────────────────────────────────
+function runAutoFixes() {
+  if (autoFixes.length === 0) {
+    console.log('\nNo auto-fixable issues found.');
+    return 0;
+  }
+
+  console.log(`\n=== Auto-Fix Mode (${autoFixes.length} fixes queued) ===`);
+
+  // Deduplicate — many issues resolve with the same kb-update.js call
+  const seen = new Set();
+  const unique = autoFixes.filter(f => {
+    if (seen.has(f.description)) return false;
+    seen.add(f.description);
+    return true;
+  });
+
+  let fixed = 0;
+  for (const fix of unique) {
+    console.log(`  Fixing: ${fix.description}...`);
+    try {
+      fix.action();
+      console.log(`    Done.`);
+      fixed++;
+    } catch (err) {
+      console.error(`    FAILED: ${err.message}`);
+    }
+  }
+
+  // Commit auto-fixes to Edge repo if anything changed
+  if (fixed > 0) {
+    const status = shellExec('git status --porcelain', EDGE_REPO);
+    if (status) {
+      console.log('\n  Committing auto-fixes...');
+      shellExec('git add -A', EDGE_REPO);
+      shellExec(`git commit -m "auto-fix: nightly audit repairs (${TODAY})"`, EDGE_REPO);
+      shellExec('git push origin master', EDGE_REPO);
+      console.log('  Pushed auto-fixes to GitHub.');
+    }
+  }
+
+  return fixed;
+}
+
 // ── Main ───────────────────────────────────────────────────────
 function main() {
-  console.log(`=== COO Nightly Audit — ${TODAY} ===\n`);
-  console.log(`Edge repo: ${EDGE_REPO}`);
+  console.log(`=== Oops Nightly Audit — ${TODAY} ===`);
+  if (FIX_MODE) console.log('  (Auto-fix mode enabled)');
+  console.log(`\nEdge repo: ${EDGE_REPO}`);
 
   if (!fs.existsSync(EDGE_REPO)) {
     console.error(`ERROR: Edge repo not found at ${EDGE_REPO}`);
@@ -547,35 +718,95 @@ function main() {
   checkGitHealth();
   checkNamingConventions();
 
-  // Generate report
-  const report = generateReport(stats);
-  fs.writeFileSync(REPORT_PATH, report, 'utf-8');
+  // Auto-fix if --fix flag is set
+  let fixCount = 0;
+  if (FIX_MODE) {
+    fixCount = runAutoFixes();
+  }
 
-  // Print summary
+  // Record trends
   const criticalFindings = findings.filter(f => f.severity === SEV.CRITICAL);
   const warningFindings = findings.filter(f => f.severity === SEV.WARNING);
   const passed = findings.filter(f => f.severity === SEV.OK).length;
 
+  const trends = recordTrend(stats, criticalFindings.length, warningFindings.length);
+  const trendAnalysis = analyzeTrends(trends);
+
+  // Generate report (with trends)
+  let report = generateReport(stats);
+
+  // Append trend section
+  if (trendAnalysis) {
+    report += '\n## Trends\n\n';
+    report += `| Metric | Change |\n|---|---|\n`;
+    report += `| KB Files | ${trendAnalysis.kbFilesDelta >= 0 ? '+' : ''}${trendAnalysis.kbFilesDelta} |\n`;
+    report += `| KB Size | ${trendAnalysis.kbSizeDelta >= 0 ? '+' : ''}${trendAnalysis.kbSizeDelta} MB |\n`;
+    report += `| Memory Files | ${trendAnalysis.memFilesDelta >= 0 ? '+' : ''}${trendAnalysis.memFilesDelta} |\n`;
+    report += `| Memory Size | ${trendAnalysis.memSizeDelta >= 0 ? '+' : ''}${trendAnalysis.memSizeDelta} MB |\n`;
+    report += `| Scripts | ${trendAnalysis.scriptsDelta >= 0 ? '+' : ''}${trendAnalysis.scriptsDelta} |\n`;
+    if (trendAnalysis.gradeChange) {
+      report += `| Grade | ${trendAnalysis.gradeChange} |\n`;
+    }
+    if (trendAnalysis.weekKbGrowth !== undefined) {
+      report += `| KB Growth (7d) | +${trendAnalysis.weekKbGrowth} files |\n`;
+      report += `| Memory Growth (7d) | +${trendAnalysis.weekMemGrowth} files |\n`;
+    }
+    report += '\n';
+    if (trendAnalysis.regressions.length > 0) {
+      report += `### Regressions Detected\n\n`;
+      for (const r of trendAnalysis.regressions) {
+        report += `- ${r}\n`;
+      }
+      report += '\n';
+    }
+    report += `*Trend data: ${trends.entries.length} days tracked*\n`;
+  }
+
+  if (FIX_MODE && fixCount > 0) {
+    report += `\n## Auto-Fixes Applied\n\n`;
+    report += `${fixCount} issue(s) auto-fixed during this run.\n`;
+  }
+
+  fs.writeFileSync(REPORT_PATH, report, 'utf-8');
+
+  // Print summary
   console.log(`\n=== Results ===`);
   console.log(`  Criticals: ${criticalFindings.length}`);
   console.log(`  Warnings:  ${warningFindings.length}`);
   console.log(`  Passed:    ${passed}`);
+  if (FIX_MODE) console.log(`  Auto-fixed: ${fixCount}`);
+  if (trendAnalysis && trendAnalysis.regressions.length > 0) {
+    console.log(`  Regressions: ${trendAnalysis.regressions.length}`);
+  }
   console.log(`\nReport saved: ${REPORT_PATH}`);
 
-  // Send Telegram alert if there are issues
+  // Send Telegram alert
   if (criticalFindings.length > 0 || warningFindings.length > 0) {
     let grade;
     if (criticalFindings.length > 0) grade = 'F -- Critical issues found';
     else if (warningFindings.length > 3) grade = 'C -- Multiple warnings';
     else grade = 'B -- Minor issues';
 
-    sendTelegramAlert(grade, criticalFindings, warningFindings, stats);
+    let trendMsg = '';
+    if (trendAnalysis) {
+      if (trendAnalysis.regressions.length > 0) {
+        trendMsg = '\nREGRESSIONS:\n' + trendAnalysis.regressions.map(r => `  ${r}`).join('\n');
+      }
+      trendMsg += `\nTrend: KB ${trendAnalysis.kbFilesDelta >= 0 ? '+' : ''}${trendAnalysis.kbFilesDelta} files | Mem ${trendAnalysis.memFilesDelta >= 0 ? '+' : ''}${trendAnalysis.memFilesDelta} files`;
+    }
+    if (FIX_MODE && fixCount > 0) {
+      trendMsg += `\nAuto-fixed: ${fixCount} issue(s)`;
+    }
+
+    sendTelegramAlert(grade, criticalFindings, warningFindings, stats, trendMsg);
   } else {
-    console.log('\nAll checks passed — no Telegram alert needed.');
+    console.log('\nAll checks passed.');
+    sendTelegramAlert('A -- All clear', [], [], stats,
+      FIX_MODE && fixCount > 0 ? `\nAuto-fixed: ${fixCount} issue(s)` : '');
   }
 
   if (criticalFindings.length > 0) {
-    console.log('\n⚠️  CRITICAL issues detected — review report immediately!');
+    console.log('\n  CRITICAL issues detected — review report immediately!');
     process.exit(2);
   }
 }
