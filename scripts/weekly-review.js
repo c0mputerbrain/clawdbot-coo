@@ -491,7 +491,30 @@ function generateReport(sections, recommendations) {
 }
 
 // ── Telegram ───────────────────────────────────────────────────
-function sendTelegram(report, overall, recommendations) {
+function getWeekSummary() {
+  const lines = [];
+
+  // Commits this week
+  const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  const log = shellExec(`git log --since="${since}" --oneline --no-merges`, EDGE_REPO);
+  if (log) {
+    const commits = log.split('\n').filter(Boolean);
+    lines.push(`Edge made ${commits.length} commits this week`);
+  }
+
+  // Auto-fix commits from Oops
+  const oopsFixes = shellExec(`git log --since="${since}" --oneline --grep="auto-fix"`, EDGE_REPO);
+  if (oopsFixes) {
+    const fixes = oopsFixes.split('\n').filter(Boolean);
+    if (fixes.length > 0) {
+      lines.push(`I auto-fixed ${fixes.length} issue(s) this week`);
+    }
+  }
+
+  return lines;
+}
+
+function sendTelegram(report, overall, recommendations, sections) {
   const CREDS_PATH = path.resolve(COO_ROOT, '.credentials', 'telegram.json');
   if (!fs.existsSync(CREDS_PATH)) return;
 
@@ -499,10 +522,63 @@ function sendTelegram(report, overall, recommendations) {
   if (!bot_token || !chat_id) return;
 
   let msg = `Oops Weekly Review -- ${TODAY}\nGrade: ${overall}\n\n`;
-  msg += `Top Actions:\n`;
-  for (const r of recommendations.slice(0, 3)) {
-    msg += `  ${r}\n`;
+
+  // Week summary
+  const summary = getWeekSummary();
+  if (summary.length > 0) {
+    msg += summary.join('\n') + '\n\n';
   }
+
+  // Section-by-section quick status
+  msg += 'Status:\n';
+  for (const s of sections) {
+    const icon = s.grade === 'CRITICAL' ? '!!!' : s.grade === 'WARNING' ? '!' : 'OK';
+    msg += `  [${icon}] ${s.title}\n`;
+  }
+  msg += '\n';
+
+  // Issues needing attention
+  const needsAttention = recommendations.filter(r => r.includes('CRITICAL') || r.includes('FIX'));
+  if (needsAttention.length > 0) {
+    msg += `Needs your attention:\n`;
+    for (const r of needsAttention.slice(0, 3)) {
+      msg += `  ${r}\n`;
+    }
+    msg += '\n';
+  }
+
+  // Key numbers from sections
+  const kbSection = sections.find(s => s.title.includes('KB'));
+  const memSection = sections.find(s => s.title.includes('Memory'));
+  if (kbSection) {
+    const filesLine = kbSection.findings.find(f => f.includes('Files indexed'));
+    if (filesLine) msg += `${filesLine}\n`;
+    const sampleLine = kbSection.findings.find(f => f.includes('Sample frontmatter'));
+    if (sampleLine) msg += `${sampleLine}\n`;
+  }
+  if (memSection) {
+    const memLine = memSection.findings.find(f => f.includes('Memory directory'));
+    if (memLine) msg += `${memLine}\n`;
+  }
+
+  // Edge intelligence
+  const edgeSection = sections.find(s => s.title.includes('Intelligence'));
+  if (edgeSection) {
+    const fails = edgeSection.findings.filter(f => f.includes('FAIL'));
+    if (fails.length > 0) {
+      msg += `\nEdge health issues:\n`;
+      for (const f of fails) {
+        msg += `  ${f.trim()}\n`;
+      }
+    } else {
+      msg += `\nEdge intelligence: all checks passing\n`;
+    }
+  }
+
+  if (needsAttention.length === 0) {
+    msg += '\nNo action needed. Everything looks good.\n';
+  }
+
   msg += `\nFull report: clawdbot-coo/reports/weekly-review-${TODAY}.md`;
 
   try {
@@ -562,7 +638,7 @@ function main() {
   const warnCount = sections.filter(s => s.grade === 'WARNING').length;
   const overall = hasC ? 'F -- Critical issues' : warnCount > 2 ? 'C -- Multiple concerns' : warnCount > 0 ? 'B -- Minor issues' : 'A -- All clear';
 
-  sendTelegram(report, overall, recommendations);
+  sendTelegram(report, overall, recommendations, sections);
 }
 
 main();

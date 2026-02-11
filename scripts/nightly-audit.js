@@ -498,6 +498,36 @@ function generateReport(stats) {
   return report;
 }
 
+// ── Edge Activity Summary ──────────────────────────────────────
+function getEdgeActivity() {
+  const lines = [];
+
+  // Recent commits from Edge (last 24h)
+  const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const log = shellExec(`git log --since="${since}" --oneline --no-merges`, EDGE_REPO);
+  if (log) {
+    const commits = log.split('\n').filter(Boolean);
+    lines.push(`Edge pushed ${commits.length} commit(s) today:`);
+    for (const c of commits.slice(0, 5)) {
+      lines.push(`  ${c}`);
+    }
+    if (commits.length > 5) lines.push(`  ... +${commits.length - 5} more`);
+  } else {
+    lines.push('Edge had no new commits today.');
+  }
+
+  // New KB files added (from git)
+  const newFiles = shellExec(`git log --since="${since}" --diff-filter=A --name-only --pretty=format: -- knowledge/`, EDGE_REPO);
+  if (newFiles) {
+    const added = newFiles.split('\n').filter(Boolean);
+    if (added.length > 0) {
+      lines.push(`New KB files: +${added.length}`);
+    }
+  }
+
+  return lines;
+}
+
 // ── Telegram Alert ─────────────────────────────────────────────
 function sendTelegramAlert(grade, criticals, warnings, stats, trendMsg = '') {
   const CREDS_PATH = path.resolve(COO_ROOT, '.credentials', 'telegram.json');
@@ -509,26 +539,80 @@ function sendTelegramAlert(grade, criticals, warnings, stats, trendMsg = '') {
   const { bot_token, chat_id } = JSON.parse(fs.readFileSync(CREDS_PATH, 'utf-8'));
   if (!bot_token || !chat_id) return;
 
-  let msg = `Oops Nightly Audit -- ${TODAY}\nGrade: ${grade}\n\n`;
+  let msg = `Oops Daily Audit -- ${TODAY}\nGrade: ${grade}\n\n`;
+
+  // Edge activity
+  const activity = getEdgeActivity();
+  if (activity.length > 0) {
+    msg += activity.join('\n') + '\n\n';
+  }
+
+  // Stats
   msg += `KB: ${stats.kbFiles} files | Memory: ${stats.memFiles} files | Scripts: ${stats.scriptFiles}\n\n`;
 
+  // Auto-fixes applied
+  if (trendMsg && trendMsg.includes('Auto-fixed')) {
+    const fixLine = trendMsg.split('\n').find(l => l.includes('Auto-fixed'));
+    if (fixLine) msg += `Changes I made:\n  ${fixLine.trim()}\n\n`;
+  }
+
+  // Issues needing attention
   if (criticals.length > 0) {
-    msg += `CRITICAL (${criticals.length}):\n`;
+    msg += `NEEDS YOUR ATTENTION:\n`;
     for (const f of criticals) {
-      msg += `  ${f.category}: ${f.message}\n`;
+      msg += `  [CRITICAL] ${f.category}: ${f.message}\n`;
     }
     msg += '\n';
   }
 
   if (warnings.length > 0) {
-    msg += `WARNINGS (${warnings.length}):\n`;
-    for (const f of warnings) {
-      msg += `  ${f.category}: ${f.message}\n`;
+    // Split into auto-fixable vs needs-human
+    const humanNeeded = warnings.filter(f =>
+      f.category === 'Security' || f.category === 'Structure' || f.category === 'Git'
+    );
+    const autoHandled = warnings.filter(f =>
+      f.category === 'Frontmatter' || f.category === 'Index' || f.category === 'Orphans'
+    );
+    const other = warnings.filter(f =>
+      !humanNeeded.includes(f) && !autoHandled.includes(f)
+    );
+
+    if (humanNeeded.length > 0) {
+      msg += `NEEDS YOUR ATTENTION:\n`;
+      for (const f of humanNeeded) {
+        msg += `  ${f.category}: ${f.message}\n`;
+      }
+      msg += '\n';
     }
-    msg += '\n';
+
+    if (autoHandled.length > 0) {
+      msg += `I handled:\n`;
+      for (const f of autoHandled) {
+        msg += `  ${f.category}: ${f.message}\n`;
+      }
+      msg += '\n';
+    }
+
+    if (other.length > 0) {
+      msg += `FYI:\n`;
+      for (const f of other) {
+        msg += `  ${f.category}: ${f.message}\n`;
+      }
+      msg += '\n';
+    }
   }
 
-  if (trendMsg) msg += trendMsg + '\n\n';
+  // Trends
+  if (trendMsg) {
+    const trendLines = trendMsg.split('\n').filter(l => l.includes('Trend:') || l.includes('REGRESSIONS'));
+    if (trendLines.length > 0) {
+      msg += trendLines.join('\n') + '\n\n';
+    }
+  }
+
+  if (criticals.length === 0 && warnings.length === 0) {
+    msg += 'All 10 checks passed. No issues.\n\n';
+  }
 
   msg += `Full report: clawdbot-coo/reports/audit-${TODAY}.md`;
 
