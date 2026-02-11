@@ -12,13 +12,13 @@
  *
  * Checks performed:
  *   1. Frontmatter validation (all KB files must have YAML frontmatter)
- *   2. Index freshness (SEARCH-INDEX.json must match actual file count)
+ *   2. Index freshness (TOPICS-INDEX.json must match actual file count)
  *   3. Directory compliance (files in correct dirs per KB-STANDARDS)
  *   4. Secret scanning (no API keys, passwords, tokens in committed files)
  *   5. Script version sprawl (multiple versions of same script)
  *   6. Memory bloat (daily logs without curation)
  *   7. File growth trends (size and count over time)
- *   8. Orphan detection (files not in SEARCH-INDEX.json)
+ *   8. Orphan detection (files not in TOPICS-INDEX.json)
  *   9. Duplicate content detection (near-identical files)
  *  10. Git health (uncommitted changes, branch status)
  */
@@ -110,7 +110,7 @@ function checkFrontmatter() {
 
   for (const f of files) {
     const rel = path.relative(KNOWLEDGE_DIR, f).replace(/\\/g, '/');
-    if (rel === 'SEARCH-INDEX.json') continue;
+    if (rel === 'TOPICS-INDEX.json') continue;
 
     const content = fs.readFileSync(f, 'utf-8');
     if (!hasFrontmatter(content)) {
@@ -160,9 +160,9 @@ function checkFrontmatter() {
 
 // Check 2: Index freshness
 function checkIndexFreshness(actualFileCount) {
-  const indexPath = path.resolve(KNOWLEDGE_DIR, 'SEARCH-INDEX.json');
+  const indexPath = path.resolve(KNOWLEDGE_DIR, 'TOPICS-INDEX.json');
   if (!fs.existsSync(indexPath)) {
-    addFinding(SEV.CRITICAL, 'Index', 'SEARCH-INDEX.json does not exist! Edge cannot search KB.');
+    addFinding(SEV.CRITICAL, 'Index', 'TOPICS-INDEX.json does not exist! Edge cannot search KB.');
     return;
   }
 
@@ -173,7 +173,7 @@ function checkIndexFreshness(actualFileCount) {
     const diff = actualFileCount - indexedCount;
 
     if (diff === 0) {
-      addFinding(SEV.OK, 'Index', `SEARCH-INDEX.json is current (${indexedCount} files, generated ${generated})`);
+      addFinding(SEV.OK, 'Index', `TOPICS-INDEX.json is current (${indexedCount} files, generated ${generated})`);
     } else if (diff > 0) {
       addFinding(SEV.WARNING, 'Index',
         `Index is STALE: ${diff} files added since last rebuild`,
@@ -196,7 +196,7 @@ function checkIndexFreshness(actualFileCount) {
       });
     }
   } catch (err) {
-    addFinding(SEV.CRITICAL, 'Index', `SEARCH-INDEX.json is corrupted: ${err.message}`);
+    addFinding(SEV.CRITICAL, 'Index', `TOPICS-INDEX.json is corrupted: ${err.message}`);
   }
 }
 
@@ -347,7 +347,7 @@ function checkGrowthTrends() {
 
 // Check 8: Orphan detection
 function checkOrphans() {
-  const indexPath = path.resolve(KNOWLEDGE_DIR, 'SEARCH-INDEX.json');
+  const indexPath = path.resolve(KNOWLEDGE_DIR, 'FILES-INDEX.json');
   if (!fs.existsSync(indexPath)) return;
 
   try {
@@ -358,14 +358,14 @@ function checkOrphans() {
 
     for (const f of actualFiles) {
       const rel = path.relative(KNOWLEDGE_DIR, f).replace(/\\/g, '/');
-      if (rel === 'SEARCH-INDEX.json') continue;
+      if (rel.endsWith('-INDEX.json')) continue;
       if (!indexedFiles.has(rel)) {
         orphans.push(rel);
       }
     }
 
     if (orphans.length === 0) {
-      addFinding(SEV.OK, 'Orphans', 'All KB files are indexed in SEARCH-INDEX.json');
+      addFinding(SEV.OK, 'Orphans', 'All KB files are indexed in TOPICS-INDEX.json');
     } else {
       addFinding(SEV.WARNING, 'Orphans',
         `${orphans.length} KB files NOT in the search index (invisible to Edge)`,
@@ -408,7 +408,7 @@ function checkNamingConventions() {
 
   for (const f of files) {
     const name = path.basename(f);
-    if (name === 'SEARCH-INDEX.json') continue;
+    if (name === 'TOPICS-INDEX.json') continue;
 
     // Check for uppercase in filenames (except INDEX.md, README.md, etc.)
     const allowedUppercase = ['INDEX.md', 'INDEX-VIDEOS.md', 'INDEX-KEY-PAGES.md',
