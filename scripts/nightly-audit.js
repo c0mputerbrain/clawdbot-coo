@@ -209,6 +209,9 @@ function checkDirectoryCompliance() {
   const allowedTopDirs = new Set([
     'amibroker', 'trade-ideas', 'mabekit', 'claude-blog', 'smb-playbooks',
     'trading', 'trading-tools', 'prompts', 'research',
+    'backtesting', 'backtests', 'cmt-dow-award', 'crypto', 'entities', 'expenses',
+    'gdrive-imports', 'infrastructure', 'life-coaching', 'orb-setups', 'strategy-rules',
+    'tradervue', 'trading-books', 'trading-research',
   ]);
 
   const violations = [];
