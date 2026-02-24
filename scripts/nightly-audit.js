@@ -14,13 +14,17 @@
  *   1. Frontmatter validation (all KB files must have YAML frontmatter)
  *   2. Index freshness (TOPICS-INDEX.json must match actual file count)
  *   3. Directory compliance (files in correct dirs per KB-STANDARDS)
- *   4. Secret scanning (no API keys, passwords, tokens in committed files)
+ *   4. Full security audit (secrets + deep scan for injection/exfiltration/hidden content)
  *   5. Script version sprawl (multiple versions of same script)
  *   6. Memory bloat (daily logs without curation)
  *   7. File growth trends (size and count over time)
  *   8. Orphan detection (files not in TOPICS-INDEX.json)
- *   9. Duplicate content detection (near-identical files)
- *  10. Git health (uncommitted changes, branch status)
+ *   9. Git health (uncommitted changes, branch status)
+ *  10. Filename naming conventions (KB-STANDARDS compliance)
+ *  11. Tag quality (tag count, consistency, orphan tags)
+ *  12. Memory curation (daily log bloat, core memory freshness, distillation)
+ *  13. Index search coverage (files indexed but unreachable via search)
+ *  14. Cron health (Edge cron job failures and circuit breakers)
  */
 
 const fs = require('fs');
@@ -226,9 +230,11 @@ function checkDirectoryCompliance() {
   }
 }
 
-// Check 4: Secret scanning
+// Check 4: Full security audit
 function checkSecrets() {
+  // ── Layer 1: Secret/credential pattern scanning ──
   const secretPatterns = [
+    // Original patterns
     { name: 'GitHub Token', pattern: /ghp_[a-zA-Z0-9]{36}/g },
     { name: 'Generic API Key', pattern: /(?:api[_-]?key|apikey)\s*[:=]\s*['"][a-zA-Z0-9]{20,}['"]/gi },
     { name: 'Password in Plain Text', pattern: /(?:password|passwd|pwd)\s*[:=]\s*['"][^'"]{8,}['"]/gi },
@@ -237,34 +243,141 @@ function checkSecrets() {
     { name: 'Private Key', pattern: /-----BEGIN (?:RSA |EC )?PRIVATE KEY-----/g },
     { name: 'Slack Token', pattern: /xox[bprs]-[0-9a-zA-Z-]{10,}/g },
     { name: 'OpenAI Key', pattern: /sk-[a-zA-Z0-9]{48}/g },
+    // New patterns
+    { name: 'Telegram Bot Token', pattern: /\b\d{8,10}:[a-zA-Z0-9_-]{35}\b/g },
+    { name: 'Anthropic API Key', pattern: /sk-ant-[a-zA-Z0-9-]{20,}/g },
+    { name: 'Google OAuth Client Secret', pattern: /(?:client_secret|client-secret)\s*[:=]\s*['"][a-zA-Z0-9_-]{20,}['"]/gi },
+    { name: 'Google OAuth Token', pattern: /ya29\.[a-zA-Z0-9_-]{50,}/g },
+    { name: 'MongoDB Connection String', pattern: /mongodb(?:\+srv)?:\/\/[^'"` \n]{10,}/gi },
+    { name: 'PostgreSQL Connection String', pattern: /postgres(?:ql)?:\/\/[^'"` \n]{10,}/gi },
+    { name: 'Redis Connection String', pattern: /redis:\/\/[^'"` \n]{10,}/gi },
+    { name: 'JWT Token', pattern: /eyJ[a-zA-Z0-9_-]{20,}\.eyJ[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,}/g },
+    { name: 'Generic Secret Assignment', pattern: /(?:secret|token|auth_key|access_key)\s*[:=]\s*['"][a-zA-Z0-9\/+_-]{20,}['"]/gi },
+    { name: 'URL with Embedded Credentials', pattern: /https?:\/\/[^:'"` \n]+:[^@'"` \n]+@[^'"` \n]+/gi },
+    { name: 'Cloudflare Token', pattern: /(?:cf_|cloudflare[_-]?)(?:api[_-]?)?(?:token|key)\s*[:=]\s*['"][a-zA-Z0-9_-]{20,}['"]/gi },
+    { name: 'GitHub OAuth/App Secret', pattern: /gho_[a-zA-Z0-9]{36}|ghu_[a-zA-Z0-9]{36}|github_pat_[a-zA-Z0-9_]{22,}/g },
   ];
 
+  // Scan .md, .js, .sh, .json, .py, .yaml, .yml, .txt files
   const allFiles = [
     ...getAllFiles(KNOWLEDGE_DIR),
+    ...getAllFiles(KNOWLEDGE_DIR, '.json'),
+    ...getAllFiles(KNOWLEDGE_DIR, '.py'),
+    ...getAllFiles(KNOWLEDGE_DIR, '.txt'),
     ...getAllFiles(MEMORY_DIR),
+    ...getAllFiles(MEMORY_DIR, '.json'),
     ...getAllFiles(SCRIPTS_DIR, '.js'),
     ...getAllFiles(SCRIPTS_DIR, '.sh'),
+    ...getAllFiles(SCRIPTS_DIR, '.py'),
+    ...getAllFiles(SCRIPTS_DIR, '.json'),
   ];
 
-  const hits = [];
-  for (const f of allFiles) {
+  // Deduplicate file list
+  const fileSet = [...new Set(allFiles)];
+
+  // Exclude known safe files (the scanner itself, test patterns, etc.)
+  // Exclude scanner tools, test files, and Edge's own behavioral config files
+  const excludePatterns = ['security-scan.js', 'sanitize.js', 'auto-pull.sh', 'test-sanitize.js'];
+  const deepScanExcludePaths = ['memory/directives.md', 'memory/self-improvement-log.md',
+    'AGENTS.md', 'HEARTBEAT.md', 'SOUL.md', 'RUNTIME-TRIGGERS.md', 'USER.md', 'IDENTITY.md'];
+
+  const secretHits = [];
+  for (const f of fileSet) {
+    const basename = path.basename(f);
+    if (excludePatterns.includes(basename)) continue;
+
     const content = fs.readFileSync(f, 'utf-8');
     const rel = path.relative(EDGE_REPO, f).replace(/\\/g, '/');
 
     for (const { name, pattern } of secretPatterns) {
       pattern.lastIndex = 0;
       if (pattern.test(content)) {
-        hits.push(`${rel}: ${name}`);
+        secretHits.push(`${rel}: ${name}`);
       }
     }
   }
 
-  if (hits.length === 0) {
+  if (secretHits.length === 0) {
     addFinding(SEV.OK, 'Security', 'No secrets detected in committed files');
   } else {
     addFinding(SEV.CRITICAL, 'Security',
-      `${hits.length} potential secrets found in committed files!`,
-      hits.join('\n'));
+      `${secretHits.length} potential secrets found in committed files!`,
+      secretHits.join('\n'));
+  }
+
+  // ── Layer 2: Deep security scan (prompt injection, exfiltration, etc.) ──
+  const deepPatterns = [
+    // Prompt injection
+    { name: 'Prompt Injection', severity: 'HIGH',
+      pattern: /ignore (?:all )?(?:previous|prior|above) (?:instructions|prompts|rules)/gi },
+    { name: 'Role Reassignment', severity: 'HIGH',
+      pattern: /you are now (?:a |an |in )/gi },
+    { name: 'Safety Bypass', severity: 'HIGH',
+      pattern: /(?:forget|override|bypass) (?:your |all )?(?:rules|safety|restrictions|guidelines)/gi },
+    { name: 'Memory Injection', severity: 'HIGH',
+      pattern: /add (?:this |the following )?(?:to|into) (?:your )?(?:memory|directives|rules|triggers)/gi },
+    { name: 'Delayed Trigger', severity: 'HIGH',
+      pattern: /on (?:your )?next (?:heartbeat|session|wake)/gi },
+    // Data exfiltration
+    { name: 'Suspicious Webhook URL', severity: 'HIGH',
+      pattern: /webhook|ngrok|pipedream|requestbin|hookbin|beeceptor|postb\.in/gi },
+    // Hidden content
+    { name: 'Zero-Width Characters', severity: 'MEDIUM',
+      pattern: /[\u200B\u200C\u200D\uFEFF\u2060\u00AD]/g },
+    { name: 'Suspicious HTML Comment', severity: 'MEDIUM',
+      pattern: /<!--[\s\S]{0,500}?(?:prompt|instruction|system|ignore|override|inject)[\s\S]{0,500}?-->/gi },
+    // Dangerous file operations
+    { name: 'Destructive rm Command', severity: 'HIGH',
+      pattern: /\brm\s+-rf\s+[\/~]/gi },
+    { name: 'SSH Key Access', severity: 'HIGH',
+      pattern: /\.ssh\/|id_rsa|authorized_keys/gi },
+  ];
+
+  // Only deep-scan recently changed files (last 7 days) for performance
+  const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const recentFiles = fileSet.filter(f => {
+    try {
+      return fs.statSync(f).mtimeMs > sevenDaysAgo;
+    } catch { return false; }
+  });
+
+  const deepHits = [];
+  for (const f of recentFiles) {
+    const basename = path.basename(f);
+    if (excludePatterns.includes(basename)) continue;
+
+    const rel = path.relative(EDGE_REPO, f).replace(/\\/g, '/');
+    // Skip Edge's own behavioral/config files (they legitimately contain trigger phrases)
+    // Also skip Edge's daily memory logs (they reference heartbeats naturally)
+    if (deepScanExcludePaths.some(p => rel === p || rel.endsWith('/' + p))) continue;
+    if (/^memory\/\d{4}-\d{2}-\d{2}\.md$/.test(rel)) continue;
+
+    const content = fs.readFileSync(f, 'utf-8');
+
+    for (const { name, severity, pattern } of deepPatterns) {
+      pattern.lastIndex = 0;
+      if (pattern.test(content)) {
+        deepHits.push({ file: rel, name, severity });
+      }
+    }
+  }
+
+  if (deepHits.length === 0) {
+    addFinding(SEV.OK, 'Security-Deep', `Deep scan clean (${recentFiles.length} recent files checked for injection/exfiltration/hidden content)`);
+  } else {
+    const criticalDeep = deepHits.filter(h => h.severity === 'CRITICAL' || h.severity === 'HIGH');
+    const mediumDeep = deepHits.filter(h => h.severity === 'MEDIUM');
+
+    if (criticalDeep.length > 0) {
+      addFinding(SEV.CRITICAL, 'Security-Deep',
+        `${criticalDeep.length} HIGH/CRITICAL security patterns detected in recent files!`,
+        criticalDeep.map(h => `${h.file}: ${h.name} [${h.severity}]`).join('\n'));
+    }
+    if (mediumDeep.length > 0) {
+      addFinding(SEV.WARNING, 'Security-Deep',
+        `${mediumDeep.length} MEDIUM security patterns in recent files (review recommended)`,
+        mediumDeep.map(h => `${h.file}: ${h.name}`).join('\n'));
+    }
   }
 }
 
@@ -436,8 +549,537 @@ function checkNamingConventions() {
   }
 }
 
+// Check 11: Tag quality
+function checkTagQuality() {
+  const files = getAllFiles(KNOWLEDGE_DIR);
+  const lowTagFiles = [];
+  const inconsistentTags = [];
+  const tagUsage = {}; // tag -> count of files using it
+
+  for (const f of files) {
+    const rel = path.relative(KNOWLEDGE_DIR, f).replace(/\\/g, '/');
+    if (rel.endsWith('.json')) continue;
+
+    const content = fs.readFileSync(f, 'utf-8');
+    if (!hasFrontmatter(content)) continue;
+
+    const meta = parseFrontmatter(content);
+    if (!meta || !meta.tags) continue;
+
+    // Parse tags from JSON array format: ["tag1", "tag2"]
+    let tags = [];
+    try {
+      const raw = meta.tags.trim();
+      if (raw.startsWith('[')) {
+        tags = JSON.parse(raw);
+      } else {
+        tags = raw.split(',').map(t => t.trim().replace(/^["']|["']$/g, ''));
+      }
+    } catch {
+      tags = [];
+    }
+
+    // Flag files with fewer than 5 tags
+    if (tags.length < 5 && tags.length > 0) {
+      lowTagFiles.push({ file: rel, count: tags.length });
+    }
+
+    // Check for inconsistent naming (camelCase or spaces instead of kebab-case)
+    for (const tag of tags) {
+      if (/[A-Z]/.test(tag) && tag !== tag.toLowerCase()) {
+        inconsistentTags.push({ file: rel, tag, issue: 'camelCase/uppercase' });
+      }
+      if (/\s/.test(tag)) {
+        inconsistentTags.push({ file: rel, tag, issue: 'contains spaces' });
+      }
+      // Track usage
+      const normalized = tag.toLowerCase().trim();
+      if (normalized) {
+        tagUsage[normalized] = (tagUsage[normalized] || 0) + 1;
+      }
+    }
+  }
+
+  // Find orphan tags (used by only 1 file — useless for search cross-referencing)
+  const orphanTags = Object.entries(tagUsage).filter(([, count]) => count === 1);
+  const totalTags = Object.keys(tagUsage).length;
+
+  const issues = [];
+  if (lowTagFiles.length > 0) {
+    issues.push(`${lowTagFiles.length} files have fewer than 5 tags (weak searchability)`);
+  }
+  if (inconsistentTags.length > 0) {
+    issues.push(`${inconsistentTags.length} tag naming violations (should be kebab-case)`);
+  }
+  if (orphanTags.length > totalTags * 0.4) {
+    issues.push(`${orphanTags.length}/${totalTags} tags are used by only 1 file (${Math.round(orphanTags.length / totalTags * 100)}% orphan rate — poor cross-referencing)`);
+  }
+
+  if (issues.length === 0) {
+    addFinding(SEV.OK, 'Tag Quality', `${totalTags} unique tags across KB, tag quality is good`);
+  } else {
+    let details = '';
+    if (lowTagFiles.length > 0) {
+      details += 'Low-tag files:\n' + lowTagFiles.slice(0, 10).map(f => `  ${f.file}: only ${f.count} tags`).join('\n');
+      if (lowTagFiles.length > 10) details += `\n  ... and ${lowTagFiles.length - 10} more`;
+      details += '\n';
+    }
+    if (inconsistentTags.length > 0) {
+      const unique = [...new Set(inconsistentTags.map(t => t.tag))];
+      details += 'Inconsistent tags: ' + unique.slice(0, 15).join(', ');
+      if (unique.length > 15) details += ` ... +${unique.length - 15} more`;
+      details += '\n';
+    }
+    details += `Tag stats: ${totalTags} unique tags, ${orphanTags.length} orphan tags (single-use)`;
+
+    addFinding(SEV.WARNING, 'Tag Quality',
+      issues.join('; '),
+      details);
+  }
+}
+
+// Check 12: Memory curation
+function checkMemoryCuration() {
+  const memFiles = getAllFiles(MEMORY_DIR);
+  const issues = [];
+  const details = [];
+
+  // Check daily logs for bloat (>500 lines = never distilled)
+  const dailyLogs = memFiles.filter(f => /\d{4}-\d{2}-\d{2}\.md$/.test(path.basename(f)));
+  const bloatedLogs = [];
+  for (const f of dailyLogs) {
+    const content = fs.readFileSync(f, 'utf-8');
+    const lineCount = content.split('\n').length;
+    if (lineCount > 500) {
+      bloatedLogs.push({ file: path.basename(f), lines: lineCount });
+    }
+  }
+
+  if (bloatedLogs.length > 0) {
+    issues.push(`${bloatedLogs.length} daily logs over 500 lines (never distilled)`);
+    details.push('Bloated logs:\n' + bloatedLogs.slice(0, 5).map(l => `  ${l.file}: ${l.lines} lines`).join('\n'));
+  }
+
+  // Check CORE_MEMORY.md freshness
+  const coreMemPath = path.resolve(MEMORY_DIR, 'CORE_MEMORY.md');
+  if (fs.existsSync(coreMemPath)) {
+    const stat = fs.statSync(coreMemPath);
+    const daysOld = (Date.now() - stat.mtimeMs) / (1000 * 60 * 60 * 24);
+    if (daysOld > 7) {
+      issues.push(`CORE_MEMORY.md hasn't been updated in ${Math.floor(daysOld)} days (stale)`);
+    }
+  } else {
+    issues.push('CORE_MEMORY.md does not exist — Edge has no persistent core memory');
+  }
+
+  // Check MEMORY.md freshness
+  const memoryMdPath = path.resolve(MEMORY_DIR, 'MEMORY.md');
+  if (fs.existsSync(memoryMdPath)) {
+    const stat = fs.statSync(memoryMdPath);
+    const daysOld = (Date.now() - stat.mtimeMs) / (1000 * 60 * 60 * 24);
+    if (daysOld > 7) {
+      issues.push(`MEMORY.md hasn't been updated in ${Math.floor(daysOld)} days`);
+    }
+  }
+
+  // Count uncurated daily logs older than 14 days
+  const oldUncurated = dailyLogs.filter(f => {
+    const match = path.basename(f).match(/(\d{4}-\d{2}-\d{2})/);
+    if (!match) return false;
+    const daysOld = (Date.now() - new Date(match[1]).getTime()) / (1000 * 60 * 60 * 24);
+    return daysOld > 14;
+  });
+
+  if (oldUncurated.length > 10) {
+    issues.push(`${oldUncurated.length} daily logs older than 14 days without curation (should be distilled into topic files)`);
+  }
+
+  // Total memory stats
+  const totalLines = dailyLogs.reduce((sum, f) => {
+    try { return sum + fs.readFileSync(f, 'utf-8').split('\n').length; } catch { return sum; }
+  }, 0);
+
+  if (issues.length === 0) {
+    addFinding(SEV.OK, 'Memory Quality', `Memory well-curated: ${dailyLogs.length} daily logs, ${memFiles.length} total files, core memories fresh`);
+  } else {
+    details.push(`Memory stats: ${dailyLogs.length} daily logs (${totalLines} total lines), ${oldUncurated.length} uncurated (>14d)`);
+    addFinding(SEV.WARNING, 'Memory Quality',
+      issues.join('; '),
+      details.join('\n'));
+  }
+}
+
+// Check 13: Index search coverage
+function checkSearchCoverage() {
+  const filesIndexPath = path.resolve(KNOWLEDGE_DIR, 'FILES-INDEX.json');
+  const topicsIndexPath = path.resolve(KNOWLEDGE_DIR, 'TOPICS-INDEX.json');
+  const keywordsIndexPath = path.resolve(KNOWLEDGE_DIR, 'KEYWORDS-INDEX.json');
+
+  // Need all three indexes to check coverage
+  if (!fs.existsSync(filesIndexPath) || !fs.existsSync(topicsIndexPath) || !fs.existsSync(keywordsIndexPath)) {
+    addFinding(SEV.INFO, 'Search Coverage', 'Cannot check search coverage — one or more index files missing');
+    return;
+  }
+
+  let filesIndex, topicsIndex, keywordsIndex;
+  try {
+    filesIndex = JSON.parse(fs.readFileSync(filesIndexPath, 'utf-8'));
+    topicsIndex = JSON.parse(fs.readFileSync(topicsIndexPath, 'utf-8'));
+    keywordsIndex = JSON.parse(fs.readFileSync(keywordsIndexPath, 'utf-8'));
+  } catch {
+    addFinding(SEV.INFO, 'Search Coverage', 'Cannot check search coverage — index files corrupted (merge conflicts?)');
+    return;
+  }
+
+  // Get all indexed files
+  const allIndexedFiles = new Set(Object.keys(filesIndex.files || {}));
+
+  // Get all files reachable via topic clusters
+  const topicReachable = new Set();
+  for (const [, files] of Object.entries(topicsIndex.topics || {})) {
+    if (Array.isArray(files)) {
+      for (const f of files) topicReachable.add(f);
+    }
+  }
+  // Also check category listings
+  for (const [, files] of Object.entries(topicsIndex.categories || {})) {
+    if (Array.isArray(files)) {
+      for (const f of files) topicReachable.add(f);
+    }
+  }
+
+  // Get all files reachable via keyword search
+  const keywordReachable = new Set();
+  for (const [, files] of Object.entries(keywordsIndex.keywords || {})) {
+    if (Array.isArray(files)) {
+      for (const f of files) keywordReachable.add(f);
+    }
+  }
+
+  // Find files that are in FILES-INDEX but unreachable via topics OR keywords
+  const unreachable = [];
+  for (const file of allIndexedFiles) {
+    if (!topicReachable.has(file) && !keywordReachable.has(file)) {
+      unreachable.push(file);
+    }
+  }
+
+  // Find files reachable by keywords only (not in any topic cluster — weaker discovery)
+  const keywordOnly = [];
+  for (const file of allIndexedFiles) {
+    if (!topicReachable.has(file) && keywordReachable.has(file)) {
+      keywordOnly.push(file);
+    }
+  }
+
+  if (unreachable.length === 0 && keywordOnly.length < allIndexedFiles.size * 0.1) {
+    addFinding(SEV.OK, 'Search Coverage',
+      `All ${allIndexedFiles.size} indexed files are searchable (${topicReachable.size} via topics, ${keywordReachable.size} via keywords)`);
+  } else {
+    const details = [];
+    if (unreachable.length > 0) {
+      details.push('UNREACHABLE (not in any topic or keyword index):\n' +
+        unreachable.slice(0, 15).map(f => `  ${f}`).join('\n') +
+        (unreachable.length > 15 ? `\n  ... and ${unreachable.length - 15} more` : ''));
+    }
+    if (keywordOnly.length > 0) {
+      details.push(`KEYWORD-ONLY (${keywordOnly.length} files not in any topic cluster — harder to discover):\n` +
+        keywordOnly.slice(0, 10).map(f => `  ${f}`).join('\n') +
+        (keywordOnly.length > 10 ? `\n  ... and ${keywordOnly.length - 10} more` : ''));
+    }
+
+    if (unreachable.length > 0) {
+      addFinding(SEV.WARNING, 'Search Coverage',
+        `${unreachable.length} indexed files are completely unsearchable (invisible to Edge)`,
+        details.join('\n\n'));
+    } else {
+      addFinding(SEV.INFO, 'Search Coverage',
+        `All files searchable, but ${keywordOnly.length} only reachable via exact keyword match (not in topic clusters)`,
+        details.join('\n\n'));
+    }
+  }
+}
+
+// Check 14: Cron health (reads report from cron-health-reporter.js)
+function checkCronHealth() {
+  const cronHealthPath = path.resolve(EDGE_REPO, 'data', 'cron-health.json');
+  if (!fs.existsSync(cronHealthPath)) {
+    addFinding(SEV.INFO, 'Cron Health', 'No cron health report found (data/cron-health.json) — Edge may not have run cron-health-reporter.js yet');
+    return;
+  }
+
+  let report;
+  try {
+    report = JSON.parse(fs.readFileSync(cronHealthPath, 'utf-8'));
+  } catch (err) {
+    addFinding(SEV.WARNING, 'Cron Health', `Failed to parse cron health report: ${err.message}`);
+    return;
+  }
+
+  const jobs = report.jobs || [];
+  const summary = report.summary || {};
+
+  // Check for circuit breakers (3+ consecutive failures) — CRITICAL
+  const circuitOpenJobs = jobs.filter(j => j.circuitOpen);
+  if (circuitOpenJobs.length > 0) {
+    addFinding(SEV.CRITICAL, 'Cron Health',
+      `${circuitOpenJobs.length} cron job(s) have circuit breakers OPEN (3+ consecutive failures)`,
+      circuitOpenJobs.map(j => `${j.id}: ${j.consecutiveFailures} consecutive failures (schedule: ${j.schedule})`).join('\n'));
+    return;
+  }
+
+  // Check for failed jobs — WARNING
+  const failedJobs = jobs.filter(j => j.status === 'failed');
+  if (failedJobs.length > 0) {
+    addFinding(SEV.WARNING, 'Cron Health',
+      `${failedJobs.length} cron job(s) failed on last run`,
+      failedJobs.map(j => `${j.id}: status=${j.status}, consecutiveFailures=${j.consecutiveFailures} (schedule: ${j.schedule})`).join('\n'));
+    return;
+  }
+
+  // Check for overdue jobs — WARNING
+  const overdueJobs = jobs.filter(j => j.status === 'overdue');
+  if (overdueJobs.length > 0) {
+    addFinding(SEV.WARNING, 'Cron Health',
+      `${overdueJobs.length} cron job(s) are overdue`,
+      overdueJobs.map(j => `${j.id}: last run ${new Date(j.lastRunAt).toISOString()} (schedule: ${j.schedule})`).join('\n'));
+    return;
+  }
+
+  // All healthy
+  addFinding(SEV.OK, 'Cron Health',
+    `All ${summary.total} cron jobs healthy (report generated ${report.generated || 'unknown'})`);
+}
+
+// ── Impact Descriptions ────────────────────────────────────────
+const IMPACT_MAP = {
+  Index: { p: 'P0', impact: 'Edge cannot search the KB — effectively blind' },
+  Security: { p: 'P0', impact: 'Potential credential exposure in committed files' },
+  Git: { p: 'P1', impact: 'Edge is running stale code or has unresolved conflicts' },
+  Frontmatter: { p: 'P2', impact: 'Files may not surface in KB searches' },
+  Orphans: { p: 'P2', impact: 'Files exist but are invisible to Edge\'s search' },
+  Structure: { p: 'P2', impact: 'Non-standard dirs may confuse search and categorization' },
+  Naming: { p: 'P3', impact: 'May break on Linux or cause path issues' },
+  Scripts: { p: 'P3', impact: 'Version sprawl creates confusion about which script is current' },
+  Memory: { p: 'P3', impact: 'Bloated memory slows context loading' },
+  'Security-Deep': { p: 'P0', impact: 'Prompt injection, data exfiltration, or hidden malicious content detected' },
+  'Tag Quality': { p: 'P2', impact: 'Poor tags degrade Edge\'s ability to find relevant KB files' },
+  'Memory Quality': { p: 'P2', impact: 'Uncurated memory means Edge loses learnings and loads stale context' },
+  'Search Coverage': { p: 'P1', impact: 'Indexed files that Edge can never find via search are wasted knowledge' },
+  'Cron Health': { p: 'P1', impact: 'Edge cron jobs failing silently means missed reports and stale data' },
+};
+
+// ── Executive Summary Generator ────────────────────────────────
+function generateExecutiveSummary(criticals, warnings, oks, stats, trendAnalysis) {
+  const parts = [];
+
+  // Lead with the most important issue
+  if (criticals.length > 0) {
+    for (const c of criticals) {
+      if (c.category === 'Index') {
+        parts.push('Edge\'s search index is corrupted — he can\'t search the KB until it\'s rebuilt.');
+      } else if (c.category === 'Security') {
+        parts.push(`Security alert: ${c.message}.`);
+      } else {
+        parts.push(`Critical issue in ${c.category}: ${c.message}.`);
+      }
+    }
+  }
+
+  // Git issues
+  const gitWarnings = warnings.filter(f => f.category === 'Git');
+  const behindMatch = gitWarnings.find(f => f.message.includes('behind'));
+  const uncommittedMatch = gitWarnings.find(f => f.message.includes('uncommitted'));
+  if (behindMatch && uncommittedMatch) {
+    parts.push('Edge has unresolved merge conflicts and is behind on pulls — he\'s stuck on stale code.');
+  } else if (behindMatch) {
+    parts.push(`Edge is ${behindMatch.message.match(/\d+/)?.[0] || 'several'} commits behind — not running our latest fixes.`);
+  } else if (uncommittedMatch) {
+    parts.push('Edge has uncommitted local changes that need attention.');
+  }
+
+  // Growth context
+  if (trendAnalysis) {
+    if (trendAnalysis.kbFilesDelta > 20) {
+      parts.push(`KB grew +${trendAnalysis.kbFilesDelta} files since yesterday — high activity.`);
+    }
+    if (trendAnalysis.regressions.length > 0) {
+      parts.push(`Regressions detected: ${trendAnalysis.regressions.join('; ')}.`);
+    }
+  }
+
+  // All clear
+  if (criticals.length === 0 && warnings.length === 0) {
+    parts.push(`All 14 checks passed. Edge is healthy — ${stats.kbFiles} KB files, ${stats.memFiles} memory files, everything indexed and clean.`);
+  }
+
+  return parts.join(' ');
+}
+
+// ── Action Items Generator ─────────────────────────────────────
+function generateActionItems(criticals, warnings, fixCount) {
+  const oopsHandles = [];
+  const edgeShould = [];
+  const alexDecides = [];
+
+  for (const f of [...criticals, ...warnings]) {
+    switch (f.category) {
+      case 'Index':
+        oopsHandles.push(`Rebuild ${f.message.includes('corrupted') ? 'corrupted' : 'stale'} search index`);
+        break;
+      case 'Frontmatter':
+        oopsHandles.push(`Fix ${f.message.match(/\d+/)?.[0] || ''} files with missing/incomplete frontmatter`);
+        break;
+      case 'Orphans':
+        oopsHandles.push(`Re-index ${f.message.match(/\d+/)?.[0] || ''} orphaned files so Edge can find them`);
+        break;
+      case 'Git':
+        if (f.message.includes('behind')) {
+          edgeShould.push('Run `git pull origin master` to sync latest (auto-pull cron should handle this going forward)');
+        } else if (f.message.includes('uncommitted')) {
+          edgeShould.push('Resolve merge conflicts in uncommitted files and commit');
+        }
+        break;
+      case 'Security':
+        if (f.severity === SEV.CRITICAL) {
+          alexDecides.push(`URGENT: ${f.message} — review and rotate exposed credentials`);
+        }
+        break;
+      case 'Security-Deep':
+        if (f.severity === SEV.CRITICAL) {
+          alexDecides.push(`SECURITY: ${f.message} — investigate immediately`);
+        } else {
+          edgeShould.push(`Review flagged security patterns: ${f.message}`);
+        }
+        break;
+      case 'Structure':
+        alexDecides.push(`${f.message.match(/\d+/)?.[0] || 'Some'} non-standard KB directories — reorganize or whitelist?`);
+        break;
+      case 'Naming':
+        alexDecides.push(`${f.message.match(/\d+/)?.[0] || 'Some'} files with naming violations (spaces in filenames) — rename?`);
+        break;
+      case 'Scripts':
+        alexDecides.push(`Script version sprawl detected — archive old versions?`);
+        break;
+      case 'Memory':
+        edgeShould.push('Curate memory — archive old daily logs, distill into MEMORY.md');
+        break;
+      case 'Tag Quality':
+        oopsHandles.push('Flag low-quality tags for repair on next kb-update run');
+        edgeShould.push('Review tag quality — files with <5 tags need better tagging for searchability');
+        break;
+      case 'Memory Quality':
+        edgeShould.push('Distill bloated daily logs into topic files and update CORE_MEMORY.md');
+        break;
+      case 'Search Coverage':
+        oopsHandles.push('Re-index unsearchable files into topic clusters on next kb-update run');
+        break;
+    }
+  }
+
+  if (fixCount > 0) {
+    oopsHandles.push(`Auto-fixed ${fixCount} issue(s) this run`);
+  }
+
+  return { oopsHandles, edgeShould, alexDecides };
+}
+
+// ── Recurring Issue Tracker ────────────────────────────────────
+function detectRecurringIssues(trends) {
+  if (trends.entries.length < 3) return [];
+  const recurring = [];
+  const recent = trends.entries.slice(-7);
+
+  // Count how many days had criticals
+  const criticalDays = recent.filter(e => e.criticals > 0).length;
+  if (criticalDays >= 2) {
+    recurring.push(`Index/critical issues have occurred ${criticalDays} times in the last ${recent.length} days — investigate root cause (likely a script corrupting TOPICS-INDEX.json)`);
+  }
+
+  // Grade instability
+  const grades = recent.map(e => e.grade);
+  const gradeChanges = grades.filter((g, i) => i > 0 && g !== grades[i - 1]).length;
+  if (gradeChanges >= 3) {
+    recurring.push(`Grade has been unstable (${grades.join(' -> ')}) — issues are being fixed but keep recurring`);
+  }
+
+  // Sustained warning count
+  const avgWarnings = recent.reduce((s, e) => s + e.warnings, 0) / recent.length;
+  if (avgWarnings > 3) {
+    recurring.push(`Averaging ${avgWarnings.toFixed(1)} warnings/day over the last week — chronic issues not being resolved`);
+  }
+
+  // Rapid KB growth
+  if (recent.length >= 5) {
+    const weekGrowth = recent[recent.length - 1].kbFiles - recent[0].kbFiles;
+    if (weekGrowth > 100) {
+      recurring.push(`KB grew +${weekGrowth} files in ${recent.length} days (${(weekGrowth / recent.length).toFixed(0)}/day) — is Edge auto-generating too much content?`);
+    }
+  }
+
+  return recurring;
+}
+
+// ── Weekly Review (Fridays) ────────────────────────────────────
+function generateWeeklyReview(trends, stats) {
+  const dayOfWeek = new Date().getDay(); // 0=Sun, 5=Fri
+  if (dayOfWeek !== 5) return null;
+
+  const weekEntries = trends.entries.slice(-5); // Mon-Fri
+  if (weekEntries.length < 2) return null;
+
+  const first = weekEntries[0];
+  const last = weekEntries[weekEntries.length - 1];
+
+  let review = `## Weekly Review (${first.date} — ${last.date})\n\n`;
+
+  // Grade trajectory
+  const grades = weekEntries.map(e => `${e.date.slice(5)}: ${e.grade}`);
+  review += `**Grade trajectory:** ${grades.join(' | ')}\n\n`;
+
+  // Week totals
+  review += `**Week changes:**\n`;
+  review += `- KB: ${first.kbFiles} -> ${last.kbFiles} (+${last.kbFiles - first.kbFiles} files, +${(last.kbSizeMB - first.kbSizeMB).toFixed(1)} MB)\n`;
+  review += `- Memory: ${first.memFiles} -> ${last.memFiles} (+${last.memFiles - first.memFiles} files)\n`;
+  review += `- Scripts: ${first.scriptFiles} -> ${last.scriptFiles} (+${last.scriptFiles - first.scriptFiles})\n\n`;
+
+  // Best/worst day
+  const bestDay = weekEntries.reduce((a, b) => (a.criticals + a.warnings) <= (b.criticals + b.warnings) ? a : b);
+  const worstDay = weekEntries.reduce((a, b) => (a.criticals + a.warnings) >= (b.criticals + b.warnings) ? a : b);
+  review += `**Best day:** ${bestDay.date} (Grade ${bestDay.grade})\n`;
+  review += `**Worst day:** ${worstDay.date} (Grade ${worstDay.grade})\n\n`;
+
+  // Script growth flag
+  const scriptDelta = last.scriptFiles - first.scriptFiles;
+  if (scriptDelta > 5) {
+    review += `**Flag:** Scripts grew by +${scriptDelta} this week — review for sprawl or unused scripts.\n\n`;
+  }
+
+  // Stale file detection
+  const staleFiles = [];
+  try {
+    const kbFiles = getAllFiles(KNOWLEDGE_DIR);
+    const thirtyDaysAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    for (const f of kbFiles) {
+      const stat = fs.statSync(f);
+      if (stat.mtimeMs < thirtyDaysAgo) {
+        staleFiles.push(path.relative(KNOWLEDGE_DIR, f).replace(/\\/g, '/'));
+      }
+    }
+  } catch {}
+
+  if (staleFiles.length > 0) {
+    review += `**Stale KB files (not modified in 30+ days):** ${staleFiles.length} files\n`;
+    review += staleFiles.slice(0, 10).map(f => `- ${f}`).join('\n') + '\n';
+    if (staleFiles.length > 10) review += `- ... and ${staleFiles.length - 10} more\n`;
+    review += '\n';
+  }
+
+  return review;
+}
+
 // ── Report Generator ───────────────────────────────────────────
-function generateReport(stats) {
+function generateReport(stats, trendAnalysis, trends, fixCount) {
   const criticals = findings.filter(f => f.severity === SEV.CRITICAL);
   const warnings = findings.filter(f => f.severity === SEV.WARNING);
   const oks = findings.filter(f => f.severity === SEV.OK);
@@ -449,10 +1091,17 @@ function generateReport(stats) {
   else if (warnings.length > 0) grade = 'B — Minor issues';
   else grade = 'A — All clear';
 
+  // Executive Summary
+  const summary = generateExecutiveSummary(criticals, warnings, oks, stats, trendAnalysis);
+
   let report = `# COO Nightly Audit — ${TODAY}\n\n`;
   report += `**Grade: ${grade}**\n`;
   report += `**Repo:** edgebot-brain\n`;
   report += `**Run at:** ${new Date().toISOString()}\n\n`;
+
+  report += `## Status Update\n\n`;
+  report += `${summary}\n\n`;
+
   report += `| Metric | Value |\n|---|---|\n`;
   report += `| KB Files | ${stats.kbFiles} (${stats.kbSizeMB} MB) |\n`;
   report += `| Memory Files | ${stats.memFiles} (${stats.memSizeMB} MB) |\n`;
@@ -462,20 +1111,50 @@ function generateReport(stats) {
   report += `| Passed | ${oks.length} |\n\n`;
   report += `---\n\n`;
 
-  if (criticals.length > 0) {
-    report += `## ${SEV.CRITICAL} Findings\n\n`;
-    for (const f of criticals) {
-      report += `### ${f.category}: ${f.message}\n`;
+  // Red Flags with Impact
+  if (criticals.length > 0 || warnings.length > 0) {
+    report += `## Red Flags\n\n`;
+    const allIssues = [...criticals, ...warnings].sort((a, b) => {
+      const pa = IMPACT_MAP[a.category]?.p || 'P9';
+      const pb = IMPACT_MAP[b.category]?.p || 'P9';
+      return pa.localeCompare(pb);
+    });
+    for (const f of allIssues) {
+      const impact = IMPACT_MAP[f.category];
+      report += `### [${impact?.p || '??'}] ${f.category}: ${f.message}\n`;
+      report += `**Impact:** ${impact?.impact || 'Unknown'}\n`;
       if (f.details) report += `\`\`\`\n${f.details}\n\`\`\`\n`;
       report += '\n';
     }
   }
 
-  if (warnings.length > 0) {
-    report += `## ${SEV.WARNING} Findings\n\n`;
-    for (const f of warnings) {
-      report += `### ${f.category}: ${f.message}\n`;
-      if (f.details) report += `\`\`\`\n${f.details}\n\`\`\`\n`;
+  // Action Items
+  const actions = generateActionItems(criticals, warnings, fixCount || 0);
+  if (actions.oopsHandles.length > 0 || actions.edgeShould.length > 0 || actions.alexDecides.length > 0) {
+    report += `## Action Items\n\n`;
+    if (actions.oopsHandles.length > 0) {
+      report += `**Oops handles (automated):**\n`;
+      for (const a of actions.oopsHandles) report += `- ${a}\n`;
+      report += '\n';
+    }
+    if (actions.edgeShould.length > 0) {
+      report += `**Edge should:**\n`;
+      for (const a of actions.edgeShould) report += `- ${a}\n`;
+      report += '\n';
+    }
+    if (actions.alexDecides.length > 0) {
+      report += `**Alex decides:**\n`;
+      for (const a of actions.alexDecides) report += `- ${a}\n`;
+      report += '\n';
+    }
+  }
+
+  // Recurring Issues
+  if (trends) {
+    const recurring = detectRecurringIssues(trends);
+    if (recurring.length > 0) {
+      report += `## Recurring Issues\n\n`;
+      for (const r of recurring) report += `- ${r}\n`;
       report += '\n';
     }
   }
@@ -495,7 +1174,7 @@ function generateReport(stats) {
 
   report += `\n---\n\n*Generated by COO nightly-audit.js*\n`;
 
-  return report;
+  return { report, grade, criticals, warnings, oks, infos, summary, actions };
 }
 
 // ── Edge Activity Summary ──────────────────────────────────────
@@ -529,7 +1208,7 @@ function getEdgeActivity() {
 }
 
 // ── Telegram Alert ─────────────────────────────────────────────
-function sendTelegramAlert(grade, criticals, warnings, stats, trendMsg = '') {
+function sendTelegramAlert(grade, reportData, stats, trendAnalysis, fixCount) {
   const CREDS_PATH = path.resolve(COO_ROOT, '.credentials', 'telegram.json');
   if (!fs.existsSync(CREDS_PATH)) {
     console.log('No Telegram credentials found — skipping alert.');
@@ -541,6 +1220,11 @@ function sendTelegramAlert(grade, criticals, warnings, stats, trendMsg = '') {
 
   let msg = `Oops Daily Audit -- ${TODAY}\nGrade: ${grade}\n\n`;
 
+  // Status update (executive summary)
+  if (reportData.summary) {
+    msg += `STATUS: ${reportData.summary}\n\n`;
+  }
+
   // Edge activity
   const activity = getEdgeActivity();
   if (activity.length > 0) {
@@ -550,68 +1234,36 @@ function sendTelegramAlert(grade, criticals, warnings, stats, trendMsg = '') {
   // Stats
   msg += `KB: ${stats.kbFiles} files | Memory: ${stats.memFiles} files | Scripts: ${stats.scriptFiles}\n\n`;
 
-  // Auto-fixes applied
-  if (trendMsg && trendMsg.includes('Auto-fixed')) {
-    const fixLine = trendMsg.split('\n').find(l => l.includes('Auto-fixed'));
-    if (fixLine) msg += `Changes I made:\n  ${fixLine.trim()}\n\n`;
-  }
-
-  // Issues needing attention
-  if (criticals.length > 0) {
-    msg += `NEEDS YOUR ATTENTION:\n`;
-    for (const f of criticals) {
-      msg += `  [CRITICAL] ${f.category}: ${f.message}\n`;
-    }
-    msg += '\n';
-  }
-
-  if (warnings.length > 0) {
-    // Split into auto-fixable vs needs-human
-    const humanNeeded = warnings.filter(f =>
-      f.category === 'Security' || f.category === 'Structure' || f.category === 'Git'
-    );
-    const autoHandled = warnings.filter(f =>
-      f.category === 'Frontmatter' || f.category === 'Index' || f.category === 'Orphans'
-    );
-    const other = warnings.filter(f =>
-      !humanNeeded.includes(f) && !autoHandled.includes(f)
-    );
-
-    if (humanNeeded.length > 0) {
-      msg += `NEEDS YOUR ATTENTION:\n`;
-      for (const f of humanNeeded) {
-        msg += `  ${f.category}: ${f.message}\n`;
-      }
+  // Action items (the key new section)
+  const actions = reportData.actions;
+  if (actions) {
+    if (actions.alexDecides.length > 0) {
+      msg += `NEEDS YOUR DECISION:\n`;
+      for (const a of actions.alexDecides) msg += `  - ${a}\n`;
       msg += '\n';
     }
-
-    if (autoHandled.length > 0) {
-      msg += `I handled:\n`;
-      for (const f of autoHandled) {
-        msg += `  ${f.category}: ${f.message}\n`;
-      }
+    if (actions.edgeShould.length > 0) {
+      msg += `EDGE SHOULD:\n`;
+      for (const a of actions.edgeShould) msg += `  - ${a}\n`;
       msg += '\n';
     }
-
-    if (other.length > 0) {
-      msg += `FYI:\n`;
-      for (const f of other) {
-        msg += `  ${f.category}: ${f.message}\n`;
-      }
+    if (actions.oopsHandles.length > 0) {
+      msg += `I HANDLED:\n`;
+      for (const a of actions.oopsHandles) msg += `  - ${a}\n`;
       msg += '\n';
     }
   }
 
   // Trends
-  if (trendMsg) {
-    const trendLines = trendMsg.split('\n').filter(l => l.includes('Trend:') || l.includes('REGRESSIONS'));
-    if (trendLines.length > 0) {
-      msg += trendLines.join('\n') + '\n\n';
+  if (trendAnalysis) {
+    if (trendAnalysis.regressions.length > 0) {
+      msg += 'REGRESSIONS:\n' + trendAnalysis.regressions.map(r => `  - ${r}`).join('\n') + '\n\n';
     }
+    msg += `Trend: KB ${trendAnalysis.kbFilesDelta >= 0 ? '+' : ''}${trendAnalysis.kbFilesDelta} files | Mem ${trendAnalysis.memFilesDelta >= 0 ? '+' : ''}${trendAnalysis.memFilesDelta} files\n\n`;
   }
 
-  if (criticals.length === 0 && warnings.length === 0) {
-    msg += 'All 10 checks passed. No issues.\n\n';
+  if (reportData.criticals.length === 0 && reportData.warnings.length === 0) {
+    msg += 'All checks passed. No issues.\n\n';
   }
 
   msg += `Full report: clawdbot-coo/reports/audit-${TODAY}.md`;
@@ -801,6 +1453,10 @@ function main() {
   checkOrphans();
   checkGitHealth();
   checkNamingConventions();
+  checkTagQuality();
+  checkMemoryCuration();
+  checkSearchCoverage();
+  checkCronHealth();
 
   // Auto-fix if --fix flag is set
   let fixCount = 0;
@@ -816,8 +1472,9 @@ function main() {
   const trends = recordTrend(stats, criticalFindings.length, warningFindings.length);
   const trendAnalysis = analyzeTrends(trends);
 
-  // Generate report (with trends)
-  let report = generateReport(stats);
+  // Generate enhanced report
+  const reportData = generateReport(stats, trendAnalysis, trends, fixCount);
+  let report = reportData.report;
 
   // Append trend section
   if (trendAnalysis) {
@@ -851,6 +1508,12 @@ function main() {
     report += `${fixCount} issue(s) auto-fixed during this run.\n`;
   }
 
+  // Weekly review on Fridays
+  const weeklyReview = generateWeeklyReview(trends, stats);
+  if (weeklyReview) {
+    report += '\n' + weeklyReview;
+  }
+
   fs.writeFileSync(REPORT_PATH, report, 'utf-8');
 
   // Print summary
@@ -862,31 +1525,20 @@ function main() {
   if (trendAnalysis && trendAnalysis.regressions.length > 0) {
     console.log(`  Regressions: ${trendAnalysis.regressions.length}`);
   }
+  if (weeklyReview) console.log('  Weekly review included (Friday)');
   console.log(`\nReport saved: ${REPORT_PATH}`);
 
   // Send Telegram alert
-  if (criticalFindings.length > 0 || warningFindings.length > 0) {
-    let grade;
-    if (criticalFindings.length > 0) grade = 'F -- Critical issues found';
-    else if (warningFindings.length > 3) grade = 'C -- Multiple warnings';
-    else grade = 'B -- Minor issues';
+  let grade;
+  if (criticalFindings.length > 0) grade = 'F -- Critical issues found';
+  else if (warningFindings.length > 3) grade = 'C -- Multiple warnings';
+  else if (warningFindings.length > 0) grade = 'B -- Minor issues';
+  else grade = 'A -- All clear';
 
-    let trendMsg = '';
-    if (trendAnalysis) {
-      if (trendAnalysis.regressions.length > 0) {
-        trendMsg = '\nREGRESSIONS:\n' + trendAnalysis.regressions.map(r => `  ${r}`).join('\n');
-      }
-      trendMsg += `\nTrend: KB ${trendAnalysis.kbFilesDelta >= 0 ? '+' : ''}${trendAnalysis.kbFilesDelta} files | Mem ${trendAnalysis.memFilesDelta >= 0 ? '+' : ''}${trendAnalysis.memFilesDelta} files`;
-    }
-    if (FIX_MODE && fixCount > 0) {
-      trendMsg += `\nAuto-fixed: ${fixCount} issue(s)`;
-    }
+  sendTelegramAlert(grade, reportData, stats, trendAnalysis, fixCount);
 
-    sendTelegramAlert(grade, criticalFindings, warningFindings, stats, trendMsg);
-  } else {
+  if (criticalFindings.length === 0 && warningFindings.length === 0) {
     console.log('\nAll checks passed.');
-    sendTelegramAlert('A -- All clear', [], [], stats,
-      FIX_MODE && fixCount > 0 ? `\nAuto-fixed: ${fixCount} issue(s)` : '');
   }
 
   if (criticalFindings.length > 0) {
