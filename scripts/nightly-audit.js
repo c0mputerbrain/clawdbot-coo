@@ -25,6 +25,7 @@
  *  12. Memory curation (daily log bloat, core memory freshness, distillation)
  *  13. Index search coverage (files indexed but unreachable via search)
  *  14. Cron health (Edge cron job failures and circuit breakers)
+ *  15. Pull lag (did Edge pull our latest fixes?)
  */
 
 const fs = require('fs');
@@ -854,6 +855,59 @@ function checkCronHealth() {
     `All ${summary.total} cron jobs healthy (report generated ${report.generated || 'unknown'})`);
 }
 
+// Check 15: Edge pull-lag detection
+function checkEdgePullLag() {
+  // Read Edge's cron-health.json for his git HEAD
+  const cronHealthPath = path.resolve(EDGE_REPO, 'data', 'cron-health.json');
+  let edgeHead = null;
+  try {
+    if (fs.existsSync(cronHealthPath)) {
+      const report = JSON.parse(fs.readFileSync(cronHealthPath, 'utf-8'));
+      edgeHead = report.gitHead || null;
+    }
+  } catch {}
+
+  if (!edgeHead) {
+    // Can't check without Edge's HEAD — skip silently (Check 14 already flags missing report)
+    return;
+  }
+
+  // Check if our last pushed commit is in Edge's history
+  const trends = loadTrends();
+  const prevEntries = trends.entries.filter(e => e.lastPushedCommit && e.date !== TODAY);
+  if (prevEntries.length === 0) return; // No previous push to check against
+
+  const lastPush = prevEntries[prevEntries.length - 1];
+
+  // Use git merge-base --is-ancestor to check if Edge's HEAD includes our push
+  const isAncestor = shellExec(
+    `git merge-base --is-ancestor ${lastPush.lastPushedCommit} ${edgeHead}`,
+    EDGE_REPO
+  );
+
+  // shellExec returns '' on success (exit 0) or '' on failure (exit 1)
+  // We need to check the exit code directly
+  let edgePulled = false;
+  try {
+    execSync(
+      `git merge-base --is-ancestor ${lastPush.lastPushedCommit} ${edgeHead}`,
+      { cwd: EDGE_REPO, timeout: 5000 }
+    );
+    edgePulled = true;
+  } catch {
+    edgePulled = false;
+  }
+
+  if (!edgePulled) {
+    addFinding(SEV.WARNING, 'Pull Lag',
+      `Edge has NOT pulled our fixes from ${lastPush.date} (commit ${lastPush.lastPushedCommit.substring(0, 7)})`,
+      `Edge's HEAD: ${edgeHead.substring(0, 7)}\nOur push: ${lastPush.lastPushedCommit.substring(0, 7)} (${lastPush.date})\nEdge is running stale code — auto-pull may not be installed yet.`);
+  } else {
+    addFinding(SEV.OK, 'Pull Lag',
+      `Edge has pulled our latest fixes (verified commit ${lastPush.lastPushedCommit.substring(0, 7)} from ${lastPush.date})`);
+  }
+}
+
 // ── Impact Descriptions ────────────────────────────────────────
 const IMPACT_MAP = {
   Index: { p: 'P0', impact: 'Edge cannot search the KB — effectively blind' },
@@ -870,6 +924,7 @@ const IMPACT_MAP = {
   'Memory Quality': { p: 'P2', impact: 'Uncurated memory means Edge loses learnings and loads stale context' },
   'Search Coverage': { p: 'P1', impact: 'Indexed files that Edge can never find via search are wasted knowledge' },
   'Cron Health': { p: 'P1', impact: 'Edge cron jobs failing silently means missed reports and stale data' },
+  'Pull Lag': { p: 'P1', impact: 'Edge is running stale code — our fixes and improvements are not reaching him' },
 };
 
 // ── Executive Summary Generator ────────────────────────────────
@@ -976,6 +1031,10 @@ function generateActionItems(criticals, warnings, fixCount) {
         break;
       case 'Search Coverage':
         oopsHandles.push('Re-index unsearchable files into topic clusters on next kb-update run');
+        break;
+      case 'Pull Lag':
+        edgeShould.push('Run `git pull origin master` — he hasn\'t pulled our latest fixes');
+        alexDecides.push('Edge hasn\'t pulled our code — check if auto-pull cron is installed');
         break;
     }
   }
@@ -1297,34 +1356,27 @@ function saveTrends(trends) {
   fs.writeFileSync(TRENDS_PATH, JSON.stringify(trends, null, 2), 'utf-8');
 }
 
-function recordTrend(stats, criticals, warnings) {
+function recordTrend(stats, criticals, warnings, lastPushedCommit) {
   const trends = loadTrends();
+
+  const entry = {
+    date: TODAY,
+    kbFiles: stats.kbFiles,
+    kbSizeMB: parseFloat(stats.kbSizeMB),
+    memFiles: stats.memFiles,
+    memSizeMB: parseFloat(stats.memSizeMB),
+    scriptFiles: stats.scriptFiles,
+    criticals,
+    warnings,
+    grade: criticals > 0 ? 'F' : warnings > 3 ? 'C' : warnings > 0 ? 'B' : 'A',
+    lastPushedCommit: lastPushedCommit || null,
+  };
 
   // Don't double-record the same day
   if (trends.entries.length > 0 && trends.entries[trends.entries.length - 1].date === TODAY) {
-    trends.entries[trends.entries.length - 1] = {
-      date: TODAY,
-      kbFiles: stats.kbFiles,
-      kbSizeMB: parseFloat(stats.kbSizeMB),
-      memFiles: stats.memFiles,
-      memSizeMB: parseFloat(stats.memSizeMB),
-      scriptFiles: stats.scriptFiles,
-      criticals,
-      warnings,
-      grade: criticals > 0 ? 'F' : warnings > 3 ? 'C' : warnings > 0 ? 'B' : 'A',
-    };
+    trends.entries[trends.entries.length - 1] = entry;
   } else {
-    trends.entries.push({
-      date: TODAY,
-      kbFiles: stats.kbFiles,
-      kbSizeMB: parseFloat(stats.kbSizeMB),
-      memFiles: stats.memFiles,
-      memSizeMB: parseFloat(stats.memSizeMB),
-      scriptFiles: stats.scriptFiles,
-      criticals,
-      warnings,
-      grade: criticals > 0 ? 'F' : warnings > 3 ? 'C' : warnings > 0 ? 'B' : 'A',
-    });
+    trends.entries.push(entry);
   }
 
   // Keep last 90 days
@@ -1460,6 +1512,7 @@ function main() {
   checkMemoryCuration();
   checkSearchCoverage();
   checkCronHealth();
+  checkEdgePullLag();
 
   // Auto-fix if --fix flag is set
   let fixCount = 0;
@@ -1467,12 +1520,15 @@ function main() {
     fixCount = runAutoFixes();
   }
 
+  // Capture Edge repo HEAD after any auto-fixes were pushed
+  const currentEdgeHead = shellExec('git rev-parse HEAD', EDGE_REPO) || null;
+
   // Record trends
   const criticalFindings = findings.filter(f => f.severity === SEV.CRITICAL);
   const warningFindings = findings.filter(f => f.severity === SEV.WARNING);
   const passed = findings.filter(f => f.severity === SEV.OK).length;
 
-  const trends = recordTrend(stats, criticalFindings.length, warningFindings.length);
+  const trends = recordTrend(stats, criticalFindings.length, warningFindings.length, currentEdgeHead);
   const trendAnalysis = analyzeTrends(trends);
 
   // Generate enhanced report
