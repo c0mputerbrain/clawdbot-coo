@@ -974,6 +974,108 @@ function generateExecutiveSummary(criticals, warnings, oks, stats, trendAnalysis
   return parts.join(' ');
 }
 
+// ── Edge Copy-Paste Script Generator ──────────────────────────
+function generateEdgeScript(category, finding) {
+  switch (category) {
+    case 'Security-Deep': {
+      const files = (finding.details || '')
+        .split('\n')
+        .map(l => l.split(':')[0].trim())
+        .filter(Boolean);
+      const fileArgs = files.length > 0
+        ? files.map(f => `"${f}"`).join(' ')
+        : '"<flagged-file>"';
+      return {
+        description: `Strip zero-width/hidden characters from flagged files`,
+        script: [
+          '#!/usr/bin/env bash',
+          '# Strip zero-width and hidden Unicode characters from flagged files',
+          `cd "$(git rev-parse --show-toplevel)" || exit 1`,
+          `for f in ${fileArgs}; do`,
+          '  if [ -f "$f" ]; then',
+          '    sed -i \'s/[\\xE2\\x80\\x8B\\xE2\\x80\\x8C\\xE2\\x80\\x8D\\xEF\\xBB\\xBF]//g\' "$f"',
+          '    echo "Cleaned: $f"',
+          '  else',
+          '    echo "Not found: $f"',
+          '  fi',
+          'done',
+          'echo "Done. Review changes with: git diff"',
+        ].join('\n'),
+      };
+    }
+
+    case 'Tag Quality': {
+      return {
+        description: `Find KB files with fewer than 5 tags and list them for tagging`,
+        script: [
+          '#!/usr/bin/env bash',
+          '# Find KB files with <5 tags so Edge can improve them',
+          `cd "$(git rev-parse --show-toplevel)/knowledge" || exit 1`,
+          'echo "=== KB files with fewer than 5 tags ==="',
+          'for f in $(find . -name "*.md" -type f); do',
+          '  tags=$(sed -n \'/^tags:/,/^[^ -]/p\' "$f" | grep -c "^  *-")',
+          '  if [ "$tags" -lt 5 ] 2>/dev/null; then',
+          '    echo "$f  ($tags tags)"',
+          '  fi',
+          'done | sort -t"(" -k2 -n',
+          'echo ""',
+          'echo "Add relevant tags to these files to improve search coverage."',
+        ].join('\n'),
+      };
+    }
+
+    case 'Memory':
+    case 'Memory Quality': {
+      return {
+        description: `Identify bloated daily logs and stale CORE_MEMORY.md for distillation`,
+        script: [
+          '#!/usr/bin/env bash',
+          '# Identify bloated daily logs + stale core memory for distillation',
+          `cd "$(git rev-parse --show-toplevel)/memory" || exit 1`,
+          'echo "=== Daily logs older than 14 days (candidates for distillation) ==="',
+          'cutoff=$(date -d "14 days ago" +%Y-%m-%d 2>/dev/null || date -v-14d +%Y-%m-%d)',
+          'for f in daily-log-*.md; do',
+          '  [ -f "$f" ] || continue',
+          '  logdate=$(echo "$f" | grep -oP "\\d{4}-\\d{2}-\\d{2}")',
+          '  if [ -n "$logdate" ] && [[ "$logdate" < "$cutoff" ]]; then',
+          '    lines=$(wc -l < "$f")',
+          '    echo "  $f  ($lines lines)"',
+          '  fi',
+          'done',
+          'echo ""',
+          'echo "=== CORE_MEMORY.md freshness ==="',
+          'if [ -f CORE_MEMORY.md ]; then',
+          '  last_mod=$(git log -1 --format="%ai" -- CORE_MEMORY.md 2>/dev/null || stat -c %y CORE_MEMORY.md)',
+          '  echo "  Last modified: $last_mod"',
+          'else',
+          '  echo "  CORE_MEMORY.md not found!"',
+          'fi',
+          'echo ""',
+          'echo "Action: Distill old daily logs into topic files, then update CORE_MEMORY.md."',
+        ].join('\n'),
+      };
+    }
+
+    case 'Git':
+    case 'Pull Lag': {
+      return {
+        description: `Pull latest code from origin master`,
+        script: [
+          '#!/usr/bin/env bash',
+          '# Pull latest code from origin',
+          `cd "$(git rev-parse --show-toplevel)" || exit 1`,
+          'echo "Current HEAD: $(git rev-parse --short HEAD)"',
+          'git pull origin master',
+          'echo "New HEAD: $(git rev-parse --short HEAD)"',
+        ].join('\n'),
+      };
+    }
+
+    default:
+      return null;
+  }
+}
+
 // ── Action Items Generator ─────────────────────────────────────
 function generateActionItems(criticals, warnings, fixCount) {
   const oopsHandles = [];
@@ -993,9 +1095,10 @@ function generateActionItems(criticals, warnings, fixCount) {
         break;
       case 'Git':
         if (f.message.includes('behind')) {
-          edgeShould.push('Run `git pull origin master` to sync latest (auto-pull cron should handle this going forward)');
+          const gitScript = generateEdgeScript('Git', f);
+          edgeShould.push(gitScript || { description: 'Run `git pull origin master` to sync latest', script: null });
         } else if (f.message.includes('uncommitted')) {
-          edgeShould.push('Resolve merge conflicts in uncommitted files and commit');
+          edgeShould.push({ description: 'Resolve merge conflicts in uncommitted files and commit', script: null });
         }
         break;
       case 'Security':
@@ -1007,7 +1110,8 @@ function generateActionItems(criticals, warnings, fixCount) {
         if (f.severity === SEV.CRITICAL) {
           alexDecides.push(`SECURITY: ${f.message} — investigate immediately`);
         } else {
-          edgeShould.push(`Review flagged security patterns: ${f.message}`);
+          const secScript = generateEdgeScript('Security-Deep', f);
+          edgeShould.push(secScript || { description: `Review flagged security patterns: ${f.message}`, script: null });
         }
         break;
       case 'Structure':
@@ -1019,23 +1123,31 @@ function generateActionItems(criticals, warnings, fixCount) {
       case 'Scripts':
         alexDecides.push(`Script version sprawl detected — archive old versions?`);
         break;
-      case 'Memory':
-        edgeShould.push('Curate memory — archive old daily logs, distill into MEMORY.md');
+      case 'Memory': {
+        const memScript = generateEdgeScript('Memory', f);
+        edgeShould.push(memScript || { description: 'Curate memory — archive old daily logs, distill into MEMORY.md', script: null });
         break;
-      case 'Tag Quality':
+      }
+      case 'Tag Quality': {
         oopsHandles.push('Flag low-quality tags for repair on next kb-update run');
-        edgeShould.push('Review tag quality — files with <5 tags need better tagging for searchability');
+        const tagScript = generateEdgeScript('Tag Quality', f);
+        edgeShould.push(tagScript || { description: 'Review tag quality — files with <5 tags need better tagging for searchability', script: null });
         break;
-      case 'Memory Quality':
-        edgeShould.push('Distill bloated daily logs into topic files and update CORE_MEMORY.md');
+      }
+      case 'Memory Quality': {
+        const mqScript = generateEdgeScript('Memory Quality', f);
+        edgeShould.push(mqScript || { description: 'Distill bloated daily logs into topic files and update CORE_MEMORY.md', script: null });
         break;
+      }
       case 'Search Coverage':
         oopsHandles.push('Re-index unsearchable files into topic clusters on next kb-update run');
         break;
-      case 'Pull Lag':
-        edgeShould.push('Run `git pull origin master` — he hasn\'t pulled our latest fixes');
+      case 'Pull Lag': {
+        const plScript = generateEdgeScript('Pull Lag', f);
+        edgeShould.push(plScript || { description: 'Run `git pull origin master` — he hasn\'t pulled our latest fixes', script: null });
         alexDecides.push('Edge hasn\'t pulled our code — check if auto-pull cron is installed');
         break;
+      }
     }
   }
 
@@ -1201,7 +1313,12 @@ function generateReport(stats, trendAnalysis, trends, fixCount) {
     }
     if (actions.edgeShould.length > 0) {
       report += `**Edge should:**\n`;
-      for (const a of actions.edgeShould) report += `- ${a}\n`;
+      for (const a of actions.edgeShould) {
+        report += `- ${a.description}\n`;
+        if (a.script) {
+          report += `\n\`\`\`bash\n${a.script}\n\`\`\`\n\n`;
+        }
+      }
       report += '\n';
     }
     if (actions.alexDecides.length > 0) {
@@ -1306,7 +1423,12 @@ function sendTelegramAlert(grade, reportData, stats, trendAnalysis, fixCount) {
     }
     if (actions.edgeShould.length > 0) {
       msg += `EDGE SHOULD:\n`;
-      for (const a of actions.edgeShould) msg += `  - ${a}\n`;
+      for (const a of actions.edgeShould) {
+        msg += `  - ${a.description}\n`;
+        if (a.script) {
+          msg += `\n${a.script}\n\n`;
+        }
+      }
       msg += '\n';
     }
     if (actions.oopsHandles.length > 0) {
@@ -1331,12 +1453,15 @@ function sendTelegramAlert(grade, reportData, stats, trendAnalysis, fixCount) {
   msg += `Full report: clawdbot-coo/reports/audit-${TODAY}.md`;
 
   try {
+    const tmpFile = path.resolve(COO_ROOT, '.tmp-telegram-msg.txt');
+    fs.writeFileSync(tmpFile, msg, 'utf-8');
     execSync(
       `curl -s -X POST "https://api.telegram.org/bot${bot_token}/sendMessage" ` +
       `--data-urlencode "chat_id=${chat_id}" ` +
-      `--data-urlencode "text=${msg.replace(/"/g, '\\"')}"`,
+      `--data-urlencode "text@${tmpFile}"`,
       { encoding: 'utf-8', timeout: 15000 }
     );
+    fs.unlinkSync(tmpFile);
     console.log('Telegram alert sent.');
   } catch (err) {
     console.error('Failed to send Telegram alert:', err.message);
