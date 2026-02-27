@@ -582,12 +582,15 @@ function sendTelegram(report, overall, recommendations, sections) {
   msg += `\nFull report: clawdbot-coo/reports/weekly-review-${TODAY}.md`;
 
   try {
+    const tmpFile = path.resolve(COO_ROOT, '.tmp-telegram-weekly.txt');
+    fs.writeFileSync(tmpFile, msg, 'utf-8');
     execSync(
       `curl -s -X POST "https://api.telegram.org/bot${bot_token}/sendMessage" ` +
       `--data-urlencode "chat_id=${chat_id}" ` +
-      `--data-urlencode "text=${msg.replace(/"/g, '\\"')}"`,
+      `--data-urlencode "text@${tmpFile}"`,
       { encoding: 'utf-8', timeout: 15000 }
     );
+    fs.unlinkSync(tmpFile);
     console.log('Telegram alert sent.');
   } catch (err) {
     console.error('Failed to send Telegram:', err.message);
